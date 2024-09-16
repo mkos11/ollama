@@ -1,103 +1,41 @@
 package llm
 
+// #cgo CFLAGS: -Illama.cpp -Illama.cpp/include -Illama.cpp/ggml/include
+// #cgo LDFLAGS: -lllama -lggml -lstdc++ -lpthread
+// #cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/build/darwin/arm64_static -L${SRCDIR}/build/darwin/arm64_static/src -L${SRCDIR}/build/darwin/arm64_static/ggml/src -framework Accelerate -framework Metal
+// #cgo darwin,amd64 LDFLAGS: -L${SRCDIR}/build/darwin/x86_64_static -L${SRCDIR}/build/darwin/x86_64_static/src -L${SRCDIR}/build/darwin/x86_64_static/ggml/src
+// #cgo windows,amd64 LDFLAGS: -static-libstdc++ -static-libgcc -static -L${SRCDIR}/build/windows/amd64_static -L${SRCDIR}/build/windows/amd64_static/src -L${SRCDIR}/build/windows/amd64_static/ggml/src
+// #cgo windows,arm64 LDFLAGS: -static-libstdc++ -static-libgcc -static -L${SRCDIR}/build/windows/arm64_static -L${SRCDIR}/build/windows/arm64_static/src -L${SRCDIR}/build/windows/arm64_static/ggml/src
+// #cgo linux,amd64 LDFLAGS: -L${SRCDIR}/build/linux/x86_64_static -L${SRCDIR}/build/linux/x86_64_static/src -L${SRCDIR}/build/linux/x86_64_static/ggml/src
+// #cgo linux,arm64 LDFLAGS: -L${SRCDIR}/build/linux/arm64_static -L${SRCDIR}/build/linux/arm64_static/src -L${SRCDIR}/build/linux/arm64_static/ggml/src
+// #include <stdlib.h>
+// #include "llama.h"
+import "C"
+
 import (
-	"context"
-	"fmt"
-	"log"
-	"os"
-	"runtime"
-
-	"github.com/pbnjay/memory"
-
-	"github.com/jmorganca/ollama/api"
-	"github.com/jmorganca/ollama/format"
-	"github.com/jmorganca/ollama/gpu"
+	"errors"
+	"unsafe"
 )
 
-type LLM interface {
-	Predict(context.Context, PredictOpts, func(PredictResult)) error
-	Embedding(context.Context, string) ([]float64, error)
-	Encode(context.Context, string) ([]int, error)
-	Decode(context.Context, []int) (string, error)
-	Close()
+// SystemInfo is an unused example of calling llama.cpp functions using CGo
+func SystemInfo() string {
+	return C.GoString(C.llama_print_system_info())
 }
 
-var AvailableShims = map[string]string{}
+func Quantize(infile, outfile string, ftype fileType) error {
+	cinfile := C.CString(infile)
+	defer C.free(unsafe.Pointer(cinfile))
 
-func New(workDir, model string, adapters, projectors []string, opts api.Options) (LLM, error) {
-	if _, err := os.Stat(model); err != nil {
-		return nil, err
+	coutfile := C.CString(outfile)
+	defer C.free(unsafe.Pointer(coutfile))
+
+	params := C.llama_model_quantize_default_params()
+	params.nthread = -1
+	params.ftype = ftype.Value()
+
+	if rc := C.llama_model_quantize(cinfile, coutfile, &params); rc != 0 {
+		return errors.New("failed to quantize model. This model architecture may not be supported, or you may need to upgrade Ollama to the latest version")
 	}
 
-	f, err := os.Open(model)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	ggml, err := DecodeGGML(f)
-	if err != nil {
-		return nil, err
-	}
-
-	if runtime.GOOS == "darwin" {
-		switch ggml.FileType() {
-		case "F32", "Q5_0", "Q5_1", "Q8_0":
-			if ggml.Name() != "gguf" && opts.NumGPU != 0 {
-				// GGML Q8_0 do not support Metal API and will
-				// cause the runner to segmentation fault so disable GPU
-				log.Printf("WARNING: GPU disabled for F32, Q5_0, Q5_1, and Q8_0")
-				opts.NumGPU = 0
-			}
-		}
-
-		var requiredMemory int64
-		var f16Multiplier int64 = 2
-
-		switch ggml.ModelType() {
-		case "3B", "7B":
-			requiredMemory = 8 * format.GigaByte
-		case "13B":
-			requiredMemory = 16 * format.GigaByte
-		case "30B", "34B", "40B":
-			requiredMemory = 32 * format.GigaByte
-		case "65B", "70B":
-			requiredMemory = 64 * format.GigaByte
-		case "180B":
-			requiredMemory = 128 * format.GigaByte
-			f16Multiplier = 4
-		}
-
-		systemMemory := int64(memory.TotalMemory())
-
-		if ggml.FileType() == "F16" && requiredMemory*f16Multiplier > systemMemory {
-			return nil, fmt.Errorf("F16 model requires at least %s of total memory", format.HumanBytes(requiredMemory))
-		} else if requiredMemory > systemMemory {
-			return nil, fmt.Errorf("model requires at least %s of total memory", format.HumanBytes(requiredMemory))
-		}
-	}
-
-	opts.NumGQA = 0
-	opts.RopeFrequencyBase = 0.0
-	opts.RopeFrequencyScale = 0.0
-	gpuInfo := gpu.GetGPUInfo()
-	return newLlmServer(gpuInfo.Library, model, adapters, projectors, ggml.NumLayers(), opts)
-}
-
-// Give any native cgo implementations an opportunity to initialize
-func Init(workdir string) error {
-	return nativeInit(workdir)
-}
-
-func newLlmServer(library, model string, adapters, projectors []string, numLayers int64, opts api.Options) (extServer, error) {
-	if _, libPresent := AvailableShims[library]; libPresent && library != "default" {
-		srv, err := newDynamicShimExtServer(AvailableShims[library], model, adapters, projectors, numLayers, opts)
-		if err == nil {
-			return srv, nil
-		}
-		log.Printf("Failed to load dynamic library - falling back to CPU mode %s", err)
-	}
-
-	return newDefaultExtServer(model, adapters, projectors, numLayers, opts)
-
+	return nil
 }
